@@ -56,8 +56,9 @@ def objective(trial, x_train, x_test, y_train, y_test):
     param = {
         "verbosity": 0,
         "objective": "reg:squarederror",
+        "device": "cuda",
         # use exact for small dataset.
-        "tree_method": "exact",
+        "tree_method": "gpu_hist",
         # defines booster, gblinear for linear functions.
         "booster": trial.suggest_categorical("booster", ["gbtree", "gblinear", "dart"]),
         # L2 regularization weight.
@@ -130,6 +131,7 @@ def train_single_model(X: pl.DataFrame, y: pl.DataFrame, model_name: str, n_tria
         "verbosity": 2,
         "objective": "reg:squarederror",
         "tree_method": "hist",
+        "device": "cuda",
         **trial.params,
     }
     print(params)
@@ -151,17 +153,46 @@ target_col = 'responder_6'
 
 models = []
 num_models = 7
-for i in range(num_models):
-    model_name = f'xgb_{i}'
-    #
-    df = get_dataset(cols=features_cols+[target_col],head=int(1e7),fraction=0.95)
-    X = df[features_cols]
-    y = df[target_col]
-    print(X.shape, y.shape)
-    model = train_single_model(X, y, model_name, n_trials=30, cv_frac=0.1)
-    models.append(model)
+# for i in range(num_models):
+#     model_name = f'xgb_{i}'
+#     #
+#     df = get_dataset(cols=features_cols+[target_col],head=int(1e7),fraction=0.95)
+#     X = df[features_cols]
+#     y = df[target_col]
+#     print(X.shape, y.shape)
+#     model = train_single_model(X, y, model_name, n_trials=30, cv_frac=0.1)
+#     models.append(model)
 
+
+# load saved model
+num_models = 7
 models = [xgb.XGBRegressor() for i in range(num_models)]
 for i, model in enumerate(models):
     model.load_model(f'xgb_{i}.json')
-    print(model)
+    model.set_params(device='cuda')
+
+# batch predicting
+
+n = 47127338
+batch_size = int(1e6)
+num_batch = n // batch_size
+lf = pl.scan_parquet(input_path)
+preds = []
+y_trues = []
+for i in range(num_batch+1):
+    print(f'Batch: {i}/{num_batch}')
+    rows = list(range(i*batch_size, min((i+1)*batch_size, n), 1))
+    df = lf.select(pl.all().gather(rows)).collect()
+    df = reduce_mem_usage(df.to_pandas())
+    _X_train = df[features_cols]
+    y_train = df[target_col]
+    X_train = [model.predict(_X_train) for model in models]
+    y_trues.append(y_train)
+    X_train = np.vstack(X_train).T
+    preds.append(X_train)
+    # booster = train_single_model(X_train, y_train, 'booster', n_trials=20)
+X_train_booster = np.row_stack(preds)
+pl.DataFrame(X_train_booster).write_parquet('X_train_booster.parquet')
+_y_trues = [x.to_numpy().reshape(-1,1) for x in y_trues]
+y_train_booster = np.row_stack(_y_trues)
+pl.DataFrame(y_train_booster).write_parquet('y_train_booster.parquet')
