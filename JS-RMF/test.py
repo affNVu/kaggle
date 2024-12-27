@@ -174,7 +174,7 @@ for i, model in enumerate(models):
 # batch predicting
 
 n = 47127338
-batch_size = int(1e6)
+batch_size = int(1e7)
 num_batch = n // batch_size
 lf = pl.scan_parquet(input_path)
 preds = []
