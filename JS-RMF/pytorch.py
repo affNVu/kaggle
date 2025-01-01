@@ -273,10 +273,10 @@ X_train_trf_corrupted = X_train_trf + noise
 # print(f'Base Linee Ridge: {r2_ridge}')
 
 # # mlp
-# mlp = MLPRegressor().fit(X_train_trf, y_train)
-# y_pred_mlp = mlp.predict(X_test_trf[:pred_head])
-# r2_mlp = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_mlp)
-# print(f'Base Linee MLP: {r2_mlp}')
+mlp = MLPRegressor().fit(X_train_trf, y_train)
+y_pred_mlp = mlp.predict(X_test_trf[:pred_head])
+r2_mlp = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_mlp)
+print(f'Base Linee MLP: {r2_mlp}')
 
 # training DAE
 # Create dataloader
@@ -344,15 +344,21 @@ reg_test_loader = DataLoader(
     drop_last=drop_last,
     num_workers=num_workers
 )
+
+total_steps = len(reg_train_loader) * n_epochs
+warmup_steps = int(0.2 * total_steps) # 20% warmup
 # print(X_trf.shape, y_train_trf.shape)
 
 reg = nn.Sequential(
     nn.Linear(X_train_trf.shape[1], 2**12),
     nn.ReLU(),
+    nn.BatchNorm1d(2**12),
     nn.Linear(2**12, 2**8),
     nn.ReLU(),
+    nn.BatchNorm1d(2**8),
     nn.Linear(2**8, 2**4),
     nn.ReLU(),
+    nn.BatchNorm1d(2**4),
     nn.Linear(2**4, 1),
     # nn.ReLU(),
     # nn.Linear(32, 16),
@@ -361,7 +367,7 @@ reg = nn.Sequential(
 ).double()
 print(y_train.shape)
 loss=nn.MSELoss() # loss function
-optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0)
+optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0.1)
 
 # training the model:
 train_model(
@@ -376,7 +382,7 @@ train_model(
     warmup_steps=1, 
     loss_fn=nn.MSELoss(),
     early_stopper=None,
-    initial_lr=1e-5, min_lr=1e-5
+    initial_lr=1e-8, min_lr=1e-8
 )
 
 

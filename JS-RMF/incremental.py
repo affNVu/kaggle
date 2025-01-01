@@ -1,6 +1,7 @@
 import polars as pl
 from sklearn.model_selection._split import _BaseKFold, indexable, _num_samples
 import numpy as np
+from sklearn.metrics import mean_squared_error, r2_score, make_scorer
 
 input_path = 'inputs/train.parquet/*/*.parquet'
 lf = pl.scan_parquet(input_path)
