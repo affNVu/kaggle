@@ -161,19 +161,43 @@ def train_model(model, train_loader, test_loader, optimizer, device,
                 
             optimizer.step()
             # Periodically evaluate the model on the training and validation sets
-            if global_step % eval_freq == 0:
-                train_loss, val_loss = evaluate_model(
-                    model, train_loader, test_loader,
-                    'cpu', 1, loss_fn
-                )
-                train_losses.append(train_loss)
-                val_losses.append(val_loss)
-                # Print the current losses
-                print(f"Ep {epoch+1} (Iter {global_step:06d}): "
+
+            # if global_step % eval_freq == 0:
+            #     train_loss, val_loss = evaluate_model(
+            #         model, train_loader, test_loader,
+            #         'cpu', 1, loss_fn
+            #     )
+            #     train_losses.append(train_loss)
+            #     val_losses.append(val_loss)
+            #     # Print the current losses
+                
+
+        train_loss, val_loss = evaluate_model(
+            model=model, train_loader=train_loader, val_loader=test_loader, device='cpu', loss_fn=loss_fn, eval_iter=None)
+        print(f"Ep {epoch+1} (Iter {global_step:06d}): "
                         f"Train loss {train_loss:.3f}, "
                         f"Val loss {val_loss:.3f}"
                 )
-    
+        if early_stopper.early_stop(val_loss):            
+            print('Plateu, Breaking') 
+            return
+        
+class EarlyStopper:
+    def __init__(self, patience=1, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.min_validation_loss = float('inf')
+
+    def early_stop(self, validation_loss):
+        if validation_loss < self.min_validation_loss:
+            self.min_validation_loss = validation_loss
+            self.counter = 0
+        elif validation_loss > (self.min_validation_loss + self.min_delta):
+            self.counter += 1
+            if self.counter >= self.patience:
+                return True
+        return False
 
 class DAE(nn.Module):
     def __init__(self, d: int):
@@ -236,7 +260,7 @@ class EarlyStopper:
                 return True
         return False
 
-lf = pl.scan_parquet('inputs/train.parquet/*/*.parquet').head(int(3e6))
+lf = pl.scan_parquet('inputs/train.parquet/*/*.parquet').head(int(5e6))
 cols = lf.columns
 feature_cols = [x for x in cols if 'feature' in x]
 target_col = 'responder_6'
@@ -259,24 +283,24 @@ X_train_trf_corrupted = X_train_trf + noise
 
 # base models
 
-# pred_head = 10 ** 5
+pred_head = 10 ** 5
 # xgb_reg = xgb.XGBRegressor()
 # xgb_reg.fit(X_train_trf, y_train)
 # y_pred_xgb = xgb_reg.predict(X_test_trf[:pred_head])
 # r2_xgb = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_xgb)
 # print(f'Base Linee XGB: {r2_xgb}')
 
-# # ridge
-# ridge = Ridge().fit(X_train_trf, y_train)
-# y_pred_ridge = ridge.predict(X_test_trf[:pred_head])
-# r2_ridge = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_ridge)
-# print(f'Base Linee Ridge: {r2_ridge}')
+# ridge
+ridge = Ridge().fit(X_train_trf, y_train)
+y_pred_ridge = ridge.predict(X_test_trf)
+r2_ridge = r2_score(y_true=y_test,y_pred=y_pred_ridge)
+print(f'Base Linee Ridge: {r2_ridge}')
 
 # # mlp
-mlp = MLPRegressor().fit(X_train_trf, y_train)
-y_pred_mlp = mlp.predict(X_test_trf[:pred_head])
-r2_mlp = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_mlp)
-print(f'Base Linee MLP: {r2_mlp}')
+# mlp = MLPRegressor([100, 50, 25, 1]).fit(X_train_trf, y_train)
+# y_pred_mlp = mlp.predict(X_test_trf)
+# r2_mlp = r2_score(y_true=y_test,y_pred=y_pred_mlp)
+# print(f'Base Linee MLP: {r2_mlp}')
 
 # training DAE
 # Create dataloader
@@ -328,8 +352,9 @@ num_workers=0
 # dae.eval()
 # X_train_dae = torch.from_numpy(X_train_trf).double()
 # X_trf = dae.encode(X_train_dae).detach()
-y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double().squeeze()
-reg_batch_size = 2**8
+y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
+y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+reg_batch_size = 128
 reg_train_loader = DataLoader(
     list(zip(X_train_trf, y_train_trf)),
     batch_size=reg_batch_size,
@@ -338,7 +363,7 @@ reg_train_loader = DataLoader(
     num_workers=num_workers
 )
 reg_test_loader = DataLoader(
-    list(zip(X_test_trf, y_test)),
+    list(zip(X_test_trf, y_test_trf)),
     batch_size=reg_batch_size,
     shuffle=shuffle,
     drop_last=drop_last,
@@ -348,18 +373,19 @@ reg_test_loader = DataLoader(
 total_steps = len(reg_train_loader) * n_epochs
 warmup_steps = int(0.2 * total_steps) # 20% warmup
 # print(X_trf.shape, y_train_trf.shape)
+early_stopper = EarlyStopper(patience=3, min_delta=10)
 
 reg = nn.Sequential(
-    nn.Linear(X_train_trf.shape[1], 2**12),
+    nn.Linear(X_train_trf.shape[1], 100),
     nn.ReLU(),
-    nn.BatchNorm1d(2**12),
-    nn.Linear(2**12, 2**8),
+    nn.BatchNorm1d(100),
+    nn.Linear(100, 50),
     nn.ReLU(),
-    nn.BatchNorm1d(2**8),
-    nn.Linear(2**8, 2**4),
+    nn.BatchNorm1d(50),
+    nn.Linear(50, 25),
     nn.ReLU(),
-    nn.BatchNorm1d(2**4),
-    nn.Linear(2**4, 1),
+    nn.BatchNorm1d(25),
+    nn.Linear(25, 1),
     # nn.ReLU(),
     # nn.Linear(32, 16),
     # nn.ReLU(),
@@ -376,13 +402,13 @@ train_model(
     test_loader=reg_test_loader,
     optimizer=optimizer,
     device='cpu',
-    n_epochs=10,
+    n_epochs=100,
     eval_freq=500, 
     eval_iter=1,
-    warmup_steps=1, 
+    warmup_steps=3, 
     loss_fn=nn.MSELoss(),
-    early_stopper=None,
-    initial_lr=1e-8, min_lr=1e-8
+    early_stopper=early_stopper,
+    initial_lr=1e-9, min_lr=1e-9
 )
 
 
