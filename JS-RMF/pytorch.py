@@ -260,213 +260,458 @@ class EarlyStopper:
                 return True
         return False
 
-lf = pl.scan_parquet('inputs/train.parquet/*/*.parquet').head(int(5e6))
-cols = lf.columns
+def get_df_by_date_id(start, end):
+    lf = pl.scan_parquet('inputs/train.parquet/*/*.parquet')
+    filter_ = ((pl.col('date_id') > start) & (pl.col('date_id') < end))
+    df = lf.filter(filter_).collect()
+    return df
+
+
+def get_dataset(partition_size: int = 200):
+    lf = pl.scan_parquet('inputs/train.parquet/*/*.parquet')
+    date_ids = sorted(lf.select('date_id').unique().collect()['date_id'].to_list())
+    n  = len(date_ids)
+    ranges = list(range(0, n, partition_size))
+    for i in range(0, len(ranges)-1):
+        start = ranges[i]
+        end = ranges[i+1]
+        df = get_df_by_date_id(start,end).to_pandas()
+        df = reduce_mem_usage(df)
+        yield df
+
+
+def main(partition_size=10):
+    cols = pl.scan_parquet('inputs/train.parquet/*/*.parquet').collect_schema().names()
+    feature_cols = [x for x in cols if 'feature' in x]
+    target_col = 'responder_6'
+    dfs = get_dataset(partition_size=partition_size)
+    for i, df in enumerate(dfs):
+        print(f'Iteration {i}')
+        X = df[feature_cols]
+        y = df[target_col]
+       
+        X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.01)
+         # firs iter
+        if i == 0:
+            preproc = pipeline.Pipeline(
+                steps=[
+                    ('impute', SimpleImputer(strategy='mean', fill_value=0)),
+                    # ('min_max', preprocessing.MinMaxScaler()),
+                    ('norm', preprocessing.StandardScaler()),
+                ]
+            )
+            preproc.fit(X)
+            X_train_trf = preproc.transform(X_train)
+            X_test_trf = preproc.transform(X_test)
+            reg = nn.Sequential(
+                nn.Linear(X_train_trf.shape[1], 100),
+                nn.ReLU(),
+                nn.BatchNorm1d(100),
+                nn.Linear(100, 50),
+                nn.ReLU(),
+                nn.BatchNorm1d(50),
+                nn.Linear(50, 25),
+                nn.ReLU(),
+                nn.BatchNorm1d(25),
+                nn.Linear(25, 1),
+                # nn.ReLU(),
+                # nn.Linear(32, 16),
+                # nn.ReLU(),
+                # nn.Linear(16, 1),
+            ).double()
+            #
+            optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0.1)
+        else:
+            X_train_trf = preproc.transform(X_train)
+            X_test_trf = preproc.transform(X_test)
+
+        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
+        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+        reg_batch_size = 128
+        reg_train_loader = DataLoader(
+            list(zip(X_train_trf, y_train_trf)),
+            batch_size=reg_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0
+        )
+        reg_test_loader = DataLoader(
+            list(zip(X_test_trf, y_test_trf)),
+            batch_size=reg_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0
+        )
+        n_epochs = 1
+        total_steps = len(reg_train_loader) * n_epochs
+        warmup_steps = int(0.1 * total_steps) # 20% warmup
+        # print(X_trf.shape, y_train_trf.shape)
+        early_stopper = EarlyStopper(patience=3, min_delta=10)
+        # training the model:
+        train_model(
+            model=reg,
+            train_loader=reg_train_loader,
+            test_loader=reg_test_loader,
+            optimizer=optimizer,
+            device='cpu',
+            n_epochs=n_epochs,
+            eval_freq=500, 
+            eval_iter=1,
+            warmup_steps=warmup_steps, 
+            loss_fn=nn.MSELoss(),
+            early_stopper=early_stopper,
+            initial_lr=1e-9, min_lr=1e-9
+        )
+        break
+
+    torch.save(reg, 'reg.pth')
+ 
+
+
+class JSModel:
+    def __init__(self, batch_size: int = 128, n_epochs: int = 100, device:str='cpu'):
+        self.a = 0
+        self.preproc = pipeline.Pipeline(
+            steps=[
+                ('impute', SimpleImputer(strategy='mean', fill_value=0)),
+                # ('min_max', preprocessing.MinMaxScaler()),
+                # ('norm', preprocessing.StandardScaler()),
+            ]
+        )
+        self.reg = None
+        self.feature_cols = feature_cols
+        self.target_col = target_col
+        self.optimizer = None
+        self.batch_size = batch_size
+        self.n_epochs = n_epochs
+        self.device = device
+
+    def fit(self, X, y):
+        X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.01)
+        X_train_trf = self.preproc.fit_transform(X_train)
+        X_test_trf = self.preproc.transform(X_test)
+        reg = nn.Sequential(
+                nn.Linear(X_train_trf.shape[1], 100),
+                nn.ReLU(),
+                nn.BatchNorm1d(100),
+                nn.Linear(100, 50),
+                nn.ReLU(),
+                nn.BatchNorm1d(50),
+                nn.Linear(50, 25),
+                nn.ReLU(),
+                nn.BatchNorm1d(25),
+                nn.Linear(25, 1),
+                # nn.ReLU(),
+                # nn.Linear(32, 16),
+                # nn.ReLU(),
+                # nn.Linear(16, 1),
+            ).double()
+        optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0.1)
+        self.optimizer = optimizer
+        #
+        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
+        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+        reg_batch_size = self.batch_size
+        reg_train_loader = DataLoader(
+            list(zip(X_train_trf, y_train_trf)),
+            batch_size=reg_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0
+        )
+        reg_test_loader = DataLoader(
+            list(zip(X_test_trf, y_test_trf)),
+            batch_size=reg_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0
+        )
+        n_epochs = self.n_epochs
+        total_steps = len(reg_train_loader) * n_epochs
+        warmup_steps = int(0.1 * total_steps) # 20% warmup
+        early_stopper = EarlyStopper(patience=3, min_delta=10)
+        train_model(
+            model=reg,
+            train_loader=reg_train_loader,
+            test_loader=reg_test_loader,
+            optimizer=optimizer,
+            device=self.device,
+            n_epochs=n_epochs,
+            eval_freq=500, 
+            eval_iter=1,
+            warmup_steps=warmup_steps, 
+            loss_fn=nn.MSELoss(),
+            early_stopper=early_stopper,
+            initial_lr=1e-9, min_lr=1e-9
+        )   
+        self.reg = reg
+        torch.save(reg, 'reg.pth')
+
+
+    def continue_fit(self, X, y):
+        X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.01)
+        #
+        X_train_trf = self.preproc.transform(X_train)
+        X_test_trf = self.preproc.transform(X_test)
+        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
+        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+        #
+        reg_batch_size = self.batch_size
+        reg_train_loader = DataLoader(
+            list(zip(X_train_trf, y_train_trf)),
+            batch_size=reg_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0
+        )
+        reg_test_loader = DataLoader(
+            list(zip(X_test_trf, y_test_trf)),
+            batch_size=reg_batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=0
+        )
+        n_epochs = self.n_epochs
+        early_stopper = EarlyStopper(patience=3, min_delta=10)
+        model = self.reg
+        train_model(
+            model=model,
+            train_loader=reg_train_loader,
+            test_loader=reg_test_loader,
+            optimizer=self.optimizer,
+            device=self.device,
+            n_epochs=n_epochs,
+            eval_freq=500, 
+            eval_iter=1,
+            warmup_steps=1, 
+            loss_fn=nn.MSELoss(),
+            early_stopper=early_stopper,
+            initial_lr=1e-9, min_lr=1e-9
+        )   
+        self.reg = model
+        torch.save(model, 'reg.pth')
+
+    def predict(self, X):
+        X_trf = self.preproc.transform(X)
+        y_pred = self.reg(torch.from_numpy(X_trf)).detach().numpy()
+        return y_pred
+
+    def score(self, X, y):
+        y_pred = self.predict(X)
+        return r2_score(y_true=y, y_pred=y_pred)
+
+df = get_df_by_date_id(0, 200)
+cols = df.columns
 feature_cols = [x for x in cols if 'feature' in x]
 target_col = 'responder_6'
-df = reduce_mem_usage(lf.collect(streaming=True).to_pandas())
 X = df[feature_cols]
 y = df[target_col]
 X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.2)
 
-preproc = pipeline.Pipeline(
-    steps=[
-        ('impute', SimpleImputer(strategy='mean', fill_value=0)),
-        # ('min_max', preprocessing.MinMaxScaler()),
-        # ('norm', preprocessing.StandardScaler()),
-    ]
-)
-X_train_trf = preproc.fit_transform(X_train)
-X_test_trf = preproc.transform(X_test)
-noise = np.random.normal(0,1,X_train_trf.shape)
-X_train_trf_corrupted = X_train_trf + noise
+model = JSModel(n_epochs=1)
+model.fit(X_train, y_train)
+model.score(X_test, y_test)
 
-# base models
 
-pred_head = 10 ** 5
-# xgb_reg = xgb.XGBRegressor()
-# xgb_reg.fit(X_train_trf, y_train)
-# y_pred_xgb = xgb_reg.predict(X_test_trf[:pred_head])
-# r2_xgb = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_xgb)
-# print(f'Base Linee XGB: {r2_xgb}')
-
-# ridge
-ridge = Ridge().fit(X_train_trf, y_train)
-y_pred_ridge = ridge.predict(X_test_trf)
-r2_ridge = r2_score(y_true=y_test,y_pred=y_pred_ridge)
-print(f'Base Linee Ridge: {r2_ridge}')
-
-# # mlp
-# mlp = MLPRegressor([100, 50, 25, 1]).fit(X_train_trf, y_train)
-# y_pred_mlp = mlp.predict(X_test_trf)
-# r2_mlp = r2_score(y_true=y_test,y_pred=y_pred_mlp)
-# print(f'Base Linee MLP: {r2_mlp}')
-
-# training DAE
-# Create dataloader
-# batch_size=2**10
-n_epochs = 100
-shuffle=True
-drop_last=True
-num_workers=0
-# train_ratio = 0.90
-# split_idx = int(train_ratio * len(X_train_trf))
-
-# train_loader = DataLoader(
-#     list(zip(X_train_trf_corrupted[:split_idx], X_train_trf[:split_idx])),
-#     batch_size=batch_size,
-#     shuffle=shuffle,
-#     drop_last=drop_last,
-#     num_workers=num_workers
+# preproc = pipeline.Pipeline(
+#     steps=[
+#         ('impute', SimpleImputer(strategy='mean', fill_value=0)),
+#         # ('min_max', preprocessing.MinMaxScaler()),
+#         # ('norm', preprocessing.StandardScaler()),
+#     ]
 # )
-# test_loader = DataLoader(
-#     list(zip(X_train_trf_corrupted[split_idx:], X_train_trf[split_idx:])),
-#     batch_size=batch_size,
-#     shuffle=shuffle,
-#     drop_last=drop_last,
-#     num_workers=num_workers
-# )
+# # X_train_trf = preproc.fit_transform(X_train)
+# # X_test_trf = preproc.transform(X_test)
+# # noise = np.random.normal(0,1,X_train_trf.shape)
+# # X_train_trf_corrupted = X_train_trf + noise
 
-# n_epochs = 1000
-# dae = DAE(d=X_train_trf.shape[1])
-# optimizer = torch.optim.AdamW(dae.parameters(), weight_decay=0.1)
-# total_steps = len(train_loader) * n_epochs
-# warmup_steps = int(0.2 * total_steps) # 20% warmup
-# loss_fn = nn.MSELoss()
-# train_model(
-#     model=dae,
-#     train_loader=train_loader,
-#     test_loader=test_loader,
-#     optimizer=optimizer,
-#     device='cpu',
-#     n_epochs=n_epochs,
-#     eval_freq=500, 
-#     eval_iter=1,
-#     warmup_steps=20, 
-#     loss_fn=nn.MSELoss(),
-#     initial_lr=1e-5, min_lr=1e-5
-# )
+# # # base models
 
-# # regression
-# # data for regression
-# dae.eval()
-# X_train_dae = torch.from_numpy(X_train_trf).double()
-# X_trf = dae.encode(X_train_dae).detach()
-y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
-y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
-reg_batch_size = 128
-reg_train_loader = DataLoader(
-    list(zip(X_train_trf, y_train_trf)),
-    batch_size=reg_batch_size,
-    shuffle=shuffle,
-    drop_last=drop_last,
-    num_workers=num_workers
-)
-reg_test_loader = DataLoader(
-    list(zip(X_test_trf, y_test_trf)),
-    batch_size=reg_batch_size,
-    shuffle=shuffle,
-    drop_last=drop_last,
-    num_workers=num_workers
-)
+# # pred_head = 10 ** 5
+# # # xgb_reg = xgb.XGBRegressor()
+# # # xgb_reg.fit(X_train_trf, y_train)
+# # # y_pred_xgb = xgb_reg.predict(X_test_trf[:pred_head])
+# # # r2_xgb = r2_score(y_true=y_test[:pred_head],y_pred=y_pred_xgb)
+# # # print(f'Base Linee XGB: {r2_xgb}')
 
-total_steps = len(reg_train_loader) * n_epochs
-warmup_steps = int(0.2 * total_steps) # 20% warmup
-# print(X_trf.shape, y_train_trf.shape)
-early_stopper = EarlyStopper(patience=3, min_delta=10)
+# # # ridge
+# # ridge = Ridge().fit(X_train_trf, y_train)
+# # y_pred_ridge = ridge.predict(X_test_trf)
+# # r2_ridge = r2_score(y_true=y_test,y_pred=y_pred_ridge)
+# # print(f'Base Linee Ridge: {r2_ridge}')
 
-reg = nn.Sequential(
-    nn.Linear(X_train_trf.shape[1], 100),
-    nn.ReLU(),
-    nn.BatchNorm1d(100),
-    nn.Linear(100, 50),
-    nn.ReLU(),
-    nn.BatchNorm1d(50),
-    nn.Linear(50, 25),
-    nn.ReLU(),
-    nn.BatchNorm1d(25),
-    nn.Linear(25, 1),
-    # nn.ReLU(),
-    # nn.Linear(32, 16),
-    # nn.ReLU(),
-    # nn.Linear(16, 1),
-).double()
-print(y_train.shape)
-loss=nn.MSELoss() # loss function
-optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0.1)
+# # # # mlp
+# # # mlp = MLPRegressor([100, 50, 25, 1]).fit(X_train_trf, y_train)
+# # # y_pred_mlp = mlp.predict(X_test_trf)
+# # # r2_mlp = r2_score(y_true=y_test,y_pred=y_pred_mlp)
+# # # print(f'Base Linee MLP: {r2_mlp}')
 
-# training the model:
-train_model(
-    model=reg,
-    train_loader=reg_train_loader,
-    test_loader=reg_test_loader,
-    optimizer=optimizer,
-    device='cpu',
-    n_epochs=100,
-    eval_freq=500, 
-    eval_iter=1,
-    warmup_steps=3, 
-    loss_fn=nn.MSELoss(),
-    early_stopper=early_stopper,
-    initial_lr=1e-9, min_lr=1e-9
-)
+# # # training DAE
+# # # Create dataloader
+# # # batch_size=2**10
+# # n_epochs = 100
+# # shuffle=True
+# # drop_last=True
+# # num_workers=0
+# # # train_ratio = 0.90
+# # # split_idx = int(train_ratio * len(X_train_trf))
+
+# # # train_loader = DataLoader(
+# # #     list(zip(X_train_trf_corrupted[:split_idx], X_train_trf[:split_idx])),
+# # #     batch_size=batch_size,
+# # #     shuffle=shuffle,
+# # #     drop_last=drop_last,
+# # #     num_workers=num_workers
+# # # )
+# # # test_loader = DataLoader(
+# # #     list(zip(X_train_trf_corrupted[split_idx:], X_train_trf[split_idx:])),
+# # #     batch_size=batch_size,
+# # #     shuffle=shuffle,
+# # #     drop_last=drop_last,
+# # #     num_workers=num_workers
+# # # )
+
+# # # n_epochs = 1000
+# # # dae = DAE(d=X_train_trf.shape[1])
+# # # optimizer = torch.optim.AdamW(dae.parameters(), weight_decay=0.1)
+# # # total_steps = len(train_loader) * n_epochs
+# # # warmup_steps = int(0.2 * total_steps) # 20% warmup
+# # # loss_fn = nn.MSELoss()
+# # # train_model(
+# # #     model=dae,
+# # #     train_loader=train_loader,
+# # #     test_loader=test_loader,
+# # #     optimizer=optimizer,
+# # #     device='cpu',
+# # #     n_epochs=n_epochs,
+# # #     eval_freq=500, 
+# # #     eval_iter=1,
+# # #     warmup_steps=20, 
+# # #     loss_fn=nn.MSELoss(),
+# # #     initial_lr=1e-5, min_lr=1e-5
+# # # )
+
+# # # # regression
+# # # # data for regression
+# # # dae.eval()
+# # # X_train_dae = torch.from_numpy(X_train_trf).double()
+# # # X_trf = dae.encode(X_train_dae).detach()
+# # y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
+# # y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+# # reg_batch_size = 128
+# # reg_train_loader = DataLoader(
+# #     list(zip(X_train_trf, y_train_trf)),
+# #     batch_size=reg_batch_size,
+# #     shuffle=shuffle,
+# #     drop_last=drop_last,
+# #     num_workers=num_workers
+# # )
+# # reg_test_loader = DataLoader(
+# #     list(zip(X_test_trf, y_test_trf)),
+# #     batch_size=reg_batch_size,
+# #     shuffle=shuffle,
+# #     drop_last=drop_last,
+# #     num_workers=num_workers
+# # )
+
+# # total_steps = len(reg_train_loader) * n_epochs
+# # warmup_steps = int(0.2 * total_steps) # 20% warmup
+# # # print(X_trf.shape, y_train_trf.shape)
+# # early_stopper = EarlyStopper(patience=3, min_delta=10)
+
+# # reg = nn.Sequential(
+# #     nn.Linear(X_train_trf.shape[1], 100),
+# #     nn.ReLU(),
+# #     nn.BatchNorm1d(100),
+# #     nn.Linear(100, 50),
+# #     nn.ReLU(),
+# #     nn.BatchNorm1d(50),
+# #     nn.Linear(50, 25),
+# #     nn.ReLU(),
+# #     nn.BatchNorm1d(25),
+# #     nn.Linear(25, 1),
+# #     # nn.ReLU(),
+# #     # nn.Linear(32, 16),
+# #     # nn.ReLU(),
+# #     # nn.Linear(16, 1),
+# # ).double()
+# # print(y_train.shape)
+# # loss=nn.MSELoss() # loss function
+# # optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0.1)
+
+# # # training the model:
+# # train_model(
+# #     model=reg,
+# #     train_loader=reg_train_loader,
+# #     test_loader=reg_test_loader,
+# #     optimizer=optimizer,
+# #     device='cpu',
+# #     n_epochs=100,
+# #     eval_freq=500, 
+# #     eval_iter=1,
+# #     warmup_steps=3, 
+# #     loss_fn=nn.MSELoss(),
+# #     early_stopper=early_stopper,
+# #     initial_lr=1e-9, min_lr=1e-9
+# # )
+
+# # torch.save(reg, 'reg.pth')
 
 
+# # # test_loader = DataLoader(
+# # #     list(zip(torch.from_numpy(X_test.to_numpy()), torch.from_numpy(y_test.to_numpy()))),
+# # #     batch_size=batch_size,
+# # #     shuffle=shuffle,
+# # #     drop_last=drop_last,
+# # #     num_workers=num_workers
+# # # )
+# # # # 
+# # # score_predictions(preproc,dae,reg,X_test,y_test)
 
-# test_loader = DataLoader(
-#     list(zip(torch.from_numpy(X_test.to_numpy()), torch.from_numpy(y_test.to_numpy()))),
-#     batch_size=batch_size,
-#     shuffle=shuffle,
-#     drop_last=drop_last,
-#     num_workers=num_workers
-# )
-# # 
-# score_predictions(preproc,dae,reg,X_test,y_test)
+# # # import xgboost as xgb
 
-# import xgboost as xgb
-
-# tree = xgb.XGBRegressor()
-# tree.fit(X_train_trf, y_train_trf)
+# # # tree = xgb.XGBRegressor()
+# # # tree.fit(X_train_trf, y_train_trf)
 
 
-class MLP(nn.Module):
-    def __init__(self, in_dim, out_dim=1):
-        super(MLP, self).__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(in_dim, 10000),
-            nn.ReLU(),
-            nn.Linear(10000, 1),
-            # nn.ReLU(),
-            # nn.Linear(32, 16),
-            # nn.ReLU(),
-            # nn.Linear(16, 1)
-        ).double()
+# # class MLP(nn.Module):
+# #     def __init__(self, in_dim, out_dim=1):
+# #         super(MLP, self).__init__()
+# #         self.layers = nn.Sequential(
+# #             nn.Linear(in_dim, 10000),
+# #             nn.ReLU(),
+# #             nn.Linear(10000, 1),
+# #             # nn.ReLU(),
+# #             # nn.Linear(32, 16),
+# #             # nn.ReLU(),
+# #             # nn.Linear(16, 1)
+# #         ).double()
         
-    def forward(self, x):
-        return self.layers(x)
-num_epochs = 1000
-batch_size = 256
-loss_func = nn.MSELoss()
-mlp_torch = MLP(in_dim=X_train_trf.shape[1])
-optimizer = torch.optim.Adam(mlp_torch.parameters(), lr=0.01, weight_decay=0.01)
-trainloader = DataLoader(list(zip(X_train_trf, y_train)), batch_size=batch_size)
-testloader = DataLoader(list(zip(X_test_trf[:10000], y_test[:10000])), batch_size=batch_size)
+# #     def forward(self, x):
+# #         return self.layers(x)
+# # num_epochs = 1000
+# # batch_size = 256
+# # loss_func = nn.MSELoss()
+# # mlp_torch = MLP(in_dim=X_train_trf.shape[1])
+# # optimizer = torch.optim.Adam(mlp_torch.parameters(), lr=0.01, weight_decay=0.01)
+# # trainloader = DataLoader(list(zip(X_train_trf, y_train)), batch_size=batch_size)
+# # testloader = DataLoader(list(zip(X_test_trf[:10000], y_test[:10000])), batch_size=batch_size)
 
-### training step
-in_sample_r2_ = []
-for epoch in range(num_epochs): 
-    in_sample_r2_temp = []
-    running_loss = []
-    for id_batch, (X_batch, y_batch) in enumerate(trainloader):
-        optimizer.zero_grad()
-        y_pred = mlp_torch(X_batch)
-        loss = loss_func(y_pred, y_batch.unsqueeze(1))
-        loss.backward()
-        optimizer.step()
-        running_loss.append(loss.item())
-        # store in-sample R-squared
-        in_sample_r2_temp.append(r2_score(y_batch.detach().numpy(), y_pred.T[0].detach().numpy()))
-    in_sample_r2_.append(np.mean(in_sample_r2_temp))
+# # ### training step
+# # in_sample_r2_ = []
+# # for epoch in range(num_epochs): 
+# #     in_sample_r2_temp = []
+# #     running_loss = []
+# #     for id_batch, (X_batch, y_batch) in enumerate(trainloader):
+# #         optimizer.zero_grad()
+# #         y_pred = mlp_torch(X_batch)
+# #         loss = loss_func(y_pred, y_batch.unsqueeze(1))
+# #         loss.backward()
+# #         optimizer.step()
+# #         running_loss.append(loss.item())
+# #         # store in-sample R-squared
+# #         in_sample_r2_temp.append(r2_score(y_batch.detach().numpy(), y_pred.T[0].detach().numpy()))
+# #     in_sample_r2_.append(np.mean(in_sample_r2_temp))
     
-    if epoch % 5 == 1:
-        print(f"Epoch {epoch}: {np.mean(running_loss)}, averaged in-sample R-squared is: {np.mean(in_sample_r2_temp)}")
+# #     if epoch % 5 == 1:
+# #         print(f"Epoch {epoch}: {np.mean(running_loss)}, averaged in-sample R-squared is: {np.mean(in_sample_r2_temp)}")
