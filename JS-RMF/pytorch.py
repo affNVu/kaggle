@@ -15,6 +15,8 @@ from sklearn.svm import SVR
 from sklearn.linear_model import Ridge
 from sklearn.neural_network import MLPRegressor
 import math
+import joblib
+
 
 def reduce_mem_usage(df):
     """ iterate through all the columns of a dataframe and modify the data type
@@ -151,7 +153,7 @@ def train_model(model, train_loader, test_loader, optimizer, device,
 
                 # Calculate and backpropagate the loss
 
-            loss = calc_loss_batch(input_batch, target_batch, model=model, loss_fn=loss_fn, device='cpu')
+            loss = calc_loss_batch(input_batch, target_batch, model=model, loss_fn=loss_fn, device=device)
             loss.backward()
 
             # Apply gradient clipping after the warmup phase to avoid exploding gradients
@@ -173,7 +175,9 @@ def train_model(model, train_loader, test_loader, optimizer, device,
                 
 
         train_loss, val_loss = evaluate_model(
-            model=model, train_loader=train_loader, val_loader=test_loader, device='cpu', loss_fn=loss_fn, eval_iter=None)
+            model=model, train_loader=train_loader, val_loader=test_loader, device=device, loss_fn=loss_fn, eval_iter=None)
+        # save every epoch
+        # joblib.dump(model, f'train_model_epoch={epoch}.joblin')
         print(f"Ep {epoch+1} (Iter {global_step:06d}): "
                         f"Train loss {train_loss:.3f}, "
                         f"Val loss {val_loss:.3f}"
@@ -346,7 +350,7 @@ def main(partition_size=10):
         total_steps = len(reg_train_loader) * n_epochs
         warmup_steps = int(0.1 * total_steps) # 20% warmup
         # print(X_trf.shape, y_train_trf.shape)
-        early_stopper = EarlyStopper(patience=3, min_delta=10)
+        # early_stopper = EarlyStopper(patience=3, min_delta=10)
         # training the model:
         train_model(
             model=reg,
@@ -405,31 +409,31 @@ class JSModel:
                 # nn.Linear(32, 16),
                 # nn.ReLU(),
                 # nn.Linear(16, 1),
-            ).double()
+            ).double().to(self.device)
         optimizer = torch.optim.AdamW(reg.parameters(), weight_decay=0.1)
         self.optimizer = optimizer
         #
-        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
-        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1).copy()).double()
+        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1).copy()).double()
         reg_batch_size = self.batch_size
         reg_train_loader = DataLoader(
             list(zip(X_train_trf, y_train_trf)),
             batch_size=reg_batch_size,
             shuffle=True,
             drop_last=True,
-            num_workers=0
+            num_workers=2
         )
         reg_test_loader = DataLoader(
             list(zip(X_test_trf, y_test_trf)),
             batch_size=reg_batch_size,
             shuffle=True,
-            drop_last=True,
-            num_workers=0
+            drop_last=False,
+            num_workers=2
         )
         n_epochs = self.n_epochs
         total_steps = len(reg_train_loader) * n_epochs
-        warmup_steps = int(0.1 * total_steps) # 20% warmup
-        early_stopper = EarlyStopper(patience=3, min_delta=10)
+        warmup_steps = math.ceil(0.1 * total_steps) # 20% warmup
+        early_stopper = EarlyStopper(patience=3, min_delta=0.0001)
         train_model(
             model=reg,
             train_loader=reg_train_loader,
@@ -445,16 +449,16 @@ class JSModel:
             initial_lr=1e-9, min_lr=1e-9
         )   
         self.reg = reg
-        torch.save(reg, 'reg.pth')
+        joblib.dump(self, 'model.joblib')
 
 
-    def continue_fit(self, X, y):
+    def continue_fit(self, X, y, i=0):
         X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.01)
         #
         X_train_trf = self.preproc.transform(X_train)
         X_test_trf = self.preproc.transform(X_test)
-        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1)).double()
-        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1)).double()
+        y_train_trf = torch.from_numpy(y_train.to_numpy().reshape(-1, 1).copy()).double()
+        y_test_trf = torch.from_numpy(y_test.to_numpy().reshape(-1, 1).copy()).double()
         #
         reg_batch_size = self.batch_size
         reg_train_loader = DataLoader(
@@ -472,8 +476,9 @@ class JSModel:
             num_workers=0
         )
         n_epochs = self.n_epochs
-        early_stopper = EarlyStopper(patience=3, min_delta=10)
+        early_stopper = EarlyStopper(patience=5, min_delta=0.0001)
         model = self.reg
+        model.to(self.device)
         train_model(
             model=model,
             train_loader=reg_train_loader,
@@ -489,28 +494,43 @@ class JSModel:
             initial_lr=1e-9, min_lr=1e-9
         )   
         self.reg = model
-        torch.save(model, 'reg.pth')
-
+        # torch.save(model, 'reg.pth')
+        joblib.dump(model, f'model_{i}.joblib')
+    
+    
     def predict(self, X):
-        X_trf = self.preproc.transform(X)
-        y_pred = self.reg(torch.from_numpy(X_trf)).detach().numpy()
+        X_trf = torch.from_numpy(self.preproc.transform(X)).to(self.device)
+        y_pred = self.reg(X_trf).cpu().detach().numpy()
         return y_pred
 
     def score(self, X, y):
         y_pred = self.predict(X)
         return r2_score(y_true=y, y_pred=y_pred)
 
-df = get_df_by_date_id(0, 200)
+df = get_df_by_date_id(0, 400)
 cols = df.columns
 feature_cols = [x for x in cols if 'feature' in x]
 target_col = 'responder_6'
 X = df[feature_cols]
 y = df[target_col]
-X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.2)
+X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.05)
 
-model = JSModel(n_epochs=1)
+model = JSModel(n_epochs=100, device=torch.device('cuda'), batch_size=2 ** 16)
 model.fit(X_train, y_train)
-model.score(X_test, y_test)
+print('score', model.score(X_test, y_test))
+
+# joblib.dump(model, 'model_start.joblib')
+
+cont = [[400, 800],[800,1200],[1200, 1600]]
+for i, (start, end) in enumerate(cont):
+    df = get_df_by_date_id(start, end)
+    X = df[feature_cols]
+    y = df[target_col]
+    X_train, X_test, y_train, y_test = model_selection.train_test_split(X, y, test_size=0.05)
+    model.continue_fit(X_train, y_train, i)
+    print('-'*30)
+    print('score', model.score(X_test, y_test))
+    joblib.dump(model, f'model_{i}.joblib')
 
 
 # preproc = pipeline.Pipeline(

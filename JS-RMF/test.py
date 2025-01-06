@@ -60,17 +60,17 @@ def objective(trial, x_train, x_test, y_train, y_test):
         # use exact for small dataset.
         "tree_method": "gpu_hist",
         # defines booster, gblinear for linear functions.
-        "booster": trial.suggest_categorical("booster", ["gbtree", "gblinear", "dart"]),
+        "booster": "gbtree",
         # L2 regularization weight.
         "lambda": trial.suggest_float("lambda", 1e-8, 1.0, log=True),
         # L1 regularization weight.
         "alpha": trial.suggest_float("alpha", 1e-8, 1.0, log=True),
         # sampling ratio for training data.
-        "subsample": trial.suggest_float("subsample", 0.2, 1.0),
+        # "subsample": trial.suggest_float("subsample", 0.2, 1.0),
         # sampling according to each tree.
         "colsample_bytree": trial.suggest_float("colsample_bytree", 0.2, 1.0),
         # 
-        "n_estimators": trial.suggest_int("n_estimators", 50, 200, step=50),
+        "n_estimators": trial.suggest_int("n_estimators", 100, 10000, step=1000),
     }
 
     if param["booster"] in ["gbtree", "dart"]:
@@ -80,14 +80,8 @@ def objective(trial, x_train, x_test, y_train, y_test):
         param["min_child_weight"] = trial.suggest_int("min_child_weight", 2, 10)
         param["eta"] = trial.suggest_float("eta", 1e-8, 1.0, log=True)
         # defines how selective algorithm is.
-        param["gamma"] = trial.suggest_float("gamma", 1e-8, 1.0, log=True)
-        param["grow_policy"] = trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"])
-
-    if param["booster"] == "dart":
-        param["sample_type"] = trial.suggest_categorical("sample_type", ["uniform", "weighted"])
-        param["normalize_type"] = trial.suggest_categorical("normalize_type", ["tree", "forest"])
-        param["rate_drop"] = trial.suggest_float("rate_drop", 1e-8, 1.0, log=True)
-        param["skip_drop"] = trial.suggest_float("skip_drop", 1e-8, 1.0, log=True)
+        # param["gamma"] = trial.suggest_float("gamma", 1e-8, 1.0, log=True)
+        # param["grow_policy"] = trial.suggest_categorical("grow_policy", ["depthwise", "lossguide"])
 
     bst = xgb.XGBRegressor(**param)
     fmse = make_scorer(mean_squared_error)
@@ -102,9 +96,13 @@ def get_dataset(
 ) -> pd.DataFrame:
     # data handling
     lf = pl.scan_parquet(input_paths)
-    head = lf.select(pl.len()).collect()['len'][0] if head is None else head
-    df = lf.head(head).select(cols).collect()
-    df = df.sample(fraction=fraction).to_pandas()
+    n = lf.select(pl.len()).collect()['len'][0]
+    k = int(n*fraction)
+    arr = np.arange(n)
+    np.random.shuffle(arr)
+    rows = arr[:k]
+    df = lf.select(pl.all().gather(rows)).select(cols).collect(streaming=True)
+    df = df.to_pandas()
     df = reduce_mem_usage(df)
     return df
 
@@ -132,6 +130,7 @@ def train_single_model(X: pl.DataFrame, y: pl.DataFrame, model_name: str, n_tria
         "objective": "reg:squarederror",
         "tree_method": "hist",
         "device": "cuda",
+        "early_stopping_rounds": 10,
         **trial.params,
     }
     print(params)
@@ -146,53 +145,107 @@ def train_single_model(X: pl.DataFrame, y: pl.DataFrame, model_name: str, n_tria
 input_path = 'inputs/train.parquet/*/*.parquet'
 lf = pl.scan_parquet(input_path)
 #
-columns = lf.columns
-features_cols = [x for x in columns if 'feature' in x]
+columns = lf.collect_schema().names()
+features_cols = [x for x in columns if 'feature' in x] + ['symbol_id']
 responder_cols = [x for x in columns if 'responder' in x]
 target_col = 'responder_6'
 
 models = []
-num_models = 7
-# for i in range(num_models):
-#     model_name = f'xgb_{i}'
-#     #
-#     df = get_dataset(cols=features_cols+[target_col],head=int(1e7),fraction=0.95)
-#     X = df[features_cols]
-#     y = df[target_col]
-#     print(X.shape, y.shape)
-#     model = train_single_model(X, y, model_name, n_trials=30, cv_frac=0.1)
-#     models.append(model)
+num_models = 3
+for i in range(num_models):
+    model_name = f'xgb_{i}'
+    #
+    df = get_dataset(cols=features_cols+[target_col],fraction=0.3)
+    X = df[features_cols]
+    y = df[target_col]
+    print(X.shape, y.shape)
+    model = train_single_model(X, y, model_name, n_trials=1000, cv_frac=0.1)
+    models.append(model)
 
 
 # load saved model
-num_models = 7
-models = [xgb.XGBRegressor() for i in range(num_models)]
-for i, model in enumerate(models):
-    model.load_model(f'xgb_{i}.json')
-    model.set_params(device='cuda')
+# num_models = 7
+# models = [xgb.XGBRegressor() for i in range(num_models)]
+# for i, model in enumerate(models):
+#     model.load_model(f'xgb_{i}.json')
+#     model.set_params(device='cuda')
 
 # batch predicting
 
+<<<<<<< HEAD
 n = 47127338
 batch_size = int(1e7)
 num_batch = n // batch_size
+=======
+# n = 47127338
+# batch_size = int(1e6)
+# num_batch = n // batch_size
+# lf = pl.scan_parquet(input_path)
+# preds = []
+# y_trues = []
+# for i in range(num_batch+1):
+#     print(f'Batch: {i}/{num_batch}')
+#     rows = list(range(i*batch_size, min((i+1)*batch_size, n), 1))
+#     df = lf.select(pl.all().gather(rows)).collect()
+#     df = reduce_mem_usage(df.to_pandas())
+#     _X_train = df[features_cols]
+#     y_train = df[target_col]
+#     X_train = [model.predict(_X_train) for model in models]
+#     y_trues.append(y_train)
+#     X_train = np.vstack(X_train).T
+#     preds.append(X_train)
+#     # booster = train_single_model(X_train, y_train, 'booster', n_trials=20)
+# X_train_booster = np.row_stack(preds)
+# pl.DataFrame(X_train_booster).write_parquet('X_train_booster.parquet')
+# _y_trues = [x.to_numpy().reshape(-1,1) for x in y_trues]
+# y_train_booster = np.row_stack(_y_trues)
+# pl.DataFrame(y_train_booster).write_parquet('y_train_booster.parquet')
+
+# # train booster
+# X_train_booster = pl.read_parquet('X_train_booster.parquet').to_numpy()
+# y_train_booster = pl.read_parquet('y_train_booster.parquet').to_numpy()
+# print(X_train_booster.shape)
+# print(y_train_booster.shape)
+# X_train, X_test, y_train, y_test = train_test_split(X_train_booster, y_train_booster, test_size=0.05)
+# # train booster
+# booster = xgb.XGBRegressor( 
+#     n_estimators=200,
+#     learning_rate=0.1,
+#     tree_method='gpu_hist',
+#     device='cuda',
+#     max_depth=6,
+#     random_state=42
+# )
+# booster.fit(X_train_booster, y_train_booster, eval_set=[(X_test, y_test)])
+# booster.save_model('booster.json')
+
+
+# # eval
+# # load saved model
+# num_models = 7
+# models = [xgb.XGBRegressor() for i in range(num_models)]
+# for i, model in enumerate(models):
+#     model.load_model(f'xgb_{i}.json')
+#     model.set_params(device='cuda')
+
+# # scores
+# preds = []
+>>>>>>> 4459c9d (update)
 lf = pl.scan_parquet(input_path)
+n = 47127338
+test_df = lf.select(pl.all().gather(list(range(n-10000,n)))).collect()
+X_test = test_df[features_cols].to_pandas()
+y_test = test_df[target_col].to_numpy()
+print(X_test.shape)
+print(y_test.shape)
 preds = []
-y_trues = []
-for i in range(num_batch+1):
-    print(f'Batch: {i}/{num_batch}')
-    rows = list(range(i*batch_size, min((i+1)*batch_size, n), 1))
-    df = lf.select(pl.all().gather(rows)).collect()
-    df = reduce_mem_usage(df.to_pandas())
-    _X_train = df[features_cols]
-    y_train = df[target_col]
-    X_train = [model.predict(_X_train) for model in models]
-    y_trues.append(y_train)
-    X_train = np.vstack(X_train).T
-    preds.append(X_train)
-    # booster = train_single_model(X_train, y_train, 'booster', n_trials=20)
-X_train_booster = np.row_stack(preds)
-pl.DataFrame(X_train_booster).write_parquet('X_train_booster.parquet')
-_y_trues = [x.to_numpy().reshape(-1,1) for x in y_trues]
-y_train_booster = np.row_stack(_y_trues)
-pl.DataFrame(y_train_booster).write_parquet('y_train_booster.parquet')
+for i, model in enumerate(models):
+    y_val_preds = model.predict(X_test)
+    preds.append(y_val_preds)
+    score = r2_score(y_true=y_test, y_pred=y_val_preds)
+    print(f'Model {i}: score: {score}')
+_preds = np.row_stack(preds).T
+_preds.shape
+
+# booster_preds = booster.predict(_preds)
+# r2_score(y_true=y_test, y_pred=booster_preds)
